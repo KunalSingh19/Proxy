@@ -56,7 +56,6 @@ const SCRAPE_SOURCES = [
   'https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all', // Plain ip:port
   'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt', // Plain ip:port
   'https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt', // Plain ip:port (HTTP subset)
-  'https://www.proxy-list.download/api/v1/get?type=http', // Plain ip:port
   'https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.txt',
   'https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=http&proxy_format=protocolipport&format=text&timeout=20000',
   'https://cdn.jsdelivr.net/gh/mzyui/proxy-list@main/all.txt',
