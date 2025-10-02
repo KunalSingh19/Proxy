@@ -1,6 +1,6 @@
-// Proxy Relay Server - Scaled for Top 3000 Healthy Proxies (Final Version with Multi-Source Parallel Scraping)
+// Proxy Relay Server - Scaled for Top 3000 Healthy Proxies (Core Version)
 // Features:
-// - Dynamic proxy scraping from multiple public sources in parallel (format support: ip:port or protocol://host:port).
+// - Dynamic proxy scraping from 7 public sources in parallel (format support: ip:port or protocol://host:port).
 // - Only uses healthy proxies (post-health check, top 3000 fastest).
 // - Proxy health checks with failover support (axios) - Runs after scraping and periodically.
 // - Separate /health endpoint to view/report health status (JSON response with healthy/total counts).
@@ -51,11 +51,12 @@ const MAX_PROXIES = 3000; // Limit to top 3000 healthy/fastest proxies
 let scrapeFailureCount = 0; // For fallback logic
 const IDLE_TIMEOUT = 5 * 60 * 1000; // 5 min idle timeout for pooled connections
 
-// Multi-source scrape URLs (6 reliable public sources for HTTP proxies)
+// Multi-source scrape URLs (sources as per logs, for HTTP proxies)
 const SCRAPE_SOURCES = [
   'https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all', // Plain ip:port
   'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt', // Plain ip:port
   'https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt', // Plain ip:port (HTTP subset)
+  'https://www.proxy-list.download/api/v1/get?type=http', // Plain ip:port
   'https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.txt',
   'https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=http&proxy_format=protocolipport&format=text&timeout=20000',
   'https://cdn.jsdelivr.net/gh/mzyui/proxy-list@main/all.txt',
@@ -63,6 +64,9 @@ const SCRAPE_SOURCES = [
  // 'https://raw.githubusercontent.com/ErcinDedeoglu/proxies/refs/heads/main/proxies/http.txt',
   'https://raw.githubusercontent.com/ErcinDedeoglu/proxies/refs/heads/main/proxies/socks5.txt'
 ];
+
+
+
 
 // Metrics
 const healthyProxiesGauge = new client.Gauge({ name: 'healthy_proxies_total', help: 'Total healthy proxies' });
