@@ -11,9 +11,10 @@ node index.js
 
 Paths
 
+```
 Public logs available at http://localhost:3000/ (tailed)
 Full logs at /logs
 Full user_proxies.txt at /user_proxies.txt
 Health status at /health (JSON, public)
 Metrics at /metrics (public)
-
+```
