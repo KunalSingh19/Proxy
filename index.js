@@ -3,14 +3,14 @@
 // - Dynamic proxy reloading via file watcher (chokidar).
 // - Proxy health checks with failover support (axios) - Runs after proxy loading and periodically.
 // - Separate /health endpoint to view/report health status (JSON response with healthy/total counts).
-// - Centralized logging with rotation (rotating-file-stream) - All logs public via /logs.
+// - Centralized logging with rotation (rotating-file-stream) - All logs public via /logs (with auth).
 // - Connection pooling for upstream proxies (basic Map-based with limits).
 // - Usage tracking and metrics (prom-client) exposed at /metrics.
-// - Public endpoints for user_proxies.txt and logs (no auth, no pagination).
+// - Paginated and authenticated public endpoints for user_proxies.txt and logs.
 // - Async file I/O for better performance.
 // - Error recovery and structured logging.
 // - Filters out invalid proxies (https://, socks4://).
-// Dependencies: npm i proxy-chain socksv5 express chokidar axios rotating-file-stream prom-client mkdirp
+// Dependencies: npm i proxy-chain socksv5 express chokidar axios rotating-file-stream prom-client express-basic-auth mkdirp
 
 const ProxyChain = require('proxy-chain');
 const socks = require('socksv5');
@@ -23,9 +23,10 @@ const chokidar = require('chokidar');
 const axios = require('axios');
 const rfs = require('rotating-file-stream');
 const client = require('prom-client');
+const basicAuth = require('express-basic-auth');
 const mkdirp = require('mkdirp');
 
-// Centralized logging with rotation - All logs captured and public
+// Centralized logging with rotation - All logs captured and public (with auth)
 const logDir = path.resolve(__dirname, 'logs');
 mkdirp.sync(logDir);
 const logStream = rfs.createStream('proxy_logs.txt', {
@@ -417,27 +418,55 @@ socksServer.on('error', (err) => {
   customLog('error', `SOCKS server error: ${err.message || err}`);
 });
 
-// --- Express server for public endpoints (no auth, no pagination) ---
+// --- Express server for public endpoints (with auth and pagination) ---
 const app = express();
 
+// Basic auth for sensitive endpoints (change credentials!)
+const AUTH_USERS = { admin: 'secretpass' };
+
+// Apply auth to all routes except /metrics and /health (for monitoring)
+app.use('/user_proxies.txt', basicAuth({
+  users: AUTH_USERS,
+  challenge: true,
+  realm: 'Proxy Admin',
+}));
+app.use('/', basicAuth({
+  users: AUTH_USERS,
+  challenge: true,
+  realm: 'Proxy Admin',
+}));
+app.use('/logs', basicAuth({
+  users: AUTH_USERS,
+  challenge: true,
+  realm: 'Proxy Admin',
+}));
+
 app.get('/user_proxies.txt', async (req, res) => {
+  const { page = 1, limit = 100, search } = req.query;
+  let start = (parseInt(page) - 1) * parseInt(limit);
   const filePath = path.resolve(__dirname, 'user_proxies.txt');
   try {
     const data = await fs.readFile(filePath, 'utf-8');
-    res.type('text/plain').send(data || 'No proxies available.');
-    customLog('info', `Served full user_proxies.txt to ${req.ip}`);
+    let lines = data.split('\n').filter(line => line.length > 0);
+    if (search) {
+      lines = lines.filter(line => line.toLowerCase().includes(search.toLowerCase()));
+    }
+    lines = lines.slice(start, start + parseInt(limit));
+    res.type('text/plain').send(lines.join('\n') || 'No matching proxies.');
+    customLog('info', `Served paginated/search user_proxies.txt (page ${page}, limit ${limit}, search: ${search || 'none'}) to ${req.ip}`);
   } catch (err) {
     customLog('warn', `Access to /user_proxies.txt failed: ${err.message}`);
     res.status(404).send('user_proxies.txt not found');
   }
 });
 
-// Public logs at / (tailed for large files)
+// Public logs at / (tailed for large files, with auth)
 app.get('/', async (req, res) => {
   const logPath = path.join(logDir, 'proxy_logs.txt'); // Latest log file
   try {
     const data = await fs.readFile(logPath, 'utf-8');
-    // Tail last 10k chars for performance with large logs
+    // Tail last 
+        // Tail last 10k chars for performance with large logs
     const tailed = data.length > 10000 ? data.slice(-10000) : data;
     res.type('text/plain').send(tailed || 'No logs yet.');
     customLog('info', `Served public logs (tailed) to ${req.ip}`);
@@ -447,7 +476,7 @@ app.get('/', async (req, res) => {
   }
 });
 
-// Full logs endpoint (full file, for small logs)
+// Alternative logs endpoint (full file, for small logs, with auth)
 app.get('/logs', async (req, res) => {
   const logPath = path.join(logDir, 'proxy_logs.txt');
   try {
@@ -461,7 +490,7 @@ app.get('/logs', async (req, res) => {
 });
 
 // Separate health check endpoint (JSON response, public for monitoring)
-app.get('/health', (req,  res) => {
+app.get('/health', (req, res) => {
   const { details = 'false' } = req.query; // Optional: ?details=true to list healthy proxies
   const healthStatus = {
     totalProxies: proxyList.length,
@@ -488,9 +517,9 @@ app.get('/metrics', async (req, res) => {
 
 app.listen(3000, '0.0.0.0', () => {
   customLog('info', 'Public file server running at http://localhost:3000/');
-  customLog('info', 'Public logs available at http://localhost:3000/ (tailed)');
-  customLog('info', 'Full logs at http://localhost:3000/logs');
-  customLog('info', 'Full user_proxies.txt at http://localhost:3000/user_proxies.txt');
+  customLog('info', 'Public logs available at http://localhost:3000/ (with auth)');
+  customLog('info', 'Paginated user_proxies.txt at http://localhost:3000/user_proxies.txt?page=1&limit=100 (with auth)');
+  customLog('info', 'Full logs at http://localhost:3000/logs (with auth)');
   customLog('info', 'Health status at http://localhost:3000/health (JSON, public)');
   customLog('info', 'Metrics at http://localhost:3000/metrics (public)');
 });
