@@ -1,7 +1,8 @@
 // Proxy Relay Server - Scaled for 3000+ Proxies
 // Features:
 // - Dynamic proxy reloading via file watcher (chokidar).
-// - Proxy health checks with failover support (axios).
+// - Proxy health checks with failover support (axios) - Runs after proxy loading and periodically.
+// - Separate /health endpoint to view/report health status (JSON response with healthy/total counts).
 // - Centralized logging with rotation (rotating-file-stream) - All logs public via /logs (with auth).
 // - Connection pooling for upstream proxies (basic Map-based with limits).
 // - Usage tracking and metrics (prom-client) exposed at /metrics.
@@ -100,25 +101,40 @@ async function loadProxies() {
   }
 }
 
-// Health check function (runs periodically)
+// Health check function (runs periodically) - Separate function for modularity
 async function healthCheck() {
-  if (proxyList.length === 0) return;
+  if (proxyList.length === 0) {
+    customLog('warn', 'No proxies loaded, skipping health check');
+    return;
+  }
+
+  customLog('info', 'Starting health check...');
   const healthy = new Set();
-  for (const proxyUrl of proxyList) {
+  // Parallelize for speed with 3000+ proxies (using Promise.allSettled)
+  const checks = proxyList.map(async (proxyUrl) => {
     try {
       const parsed = url.parse(proxyUrl);
       await axios.get('http://httpbin.org/ip', {
         proxy: { host: parsed.hostname, port: parsed.port || 8080 },
         timeout: 5000
       });
-      healthy.add(proxyUrl);
+      return proxyUrl;
     } catch (err) {
       customLog('warn', `Health check failed for ${proxyUrl}: ${err.message}`);
+      return null;
     }
-  }
+  });
+
+  const results = await Promise.allSettled(checks);
+  results.forEach((result, index) => {
+    if (result.status === 'fulfilled' && result.value) {
+      healthy.add(result.value);
+    }
+  });
+
   activeProxies = healthy;
   healthyProxiesGauge.set(healthy.size);
-  customLog('info', `${healthy.size}/${proxyList.length} healthy proxies`);
+  customLog('info', `Health check completed: ${healthy.size}/${proxyList.length} healthy proxies`);
 }
 
 // Write user proxies file (async)
@@ -137,7 +153,7 @@ async function writeUserProxiesFile() {
 }
 
 // Basic upstream proxy connection pool (Map-based, with refCount limits)
-const proxyPool = new Map(); // key: `${hostname}:${port}` -> { socket: net.Socket, refCount: number, maxConnections: 50 }
+const proxyPool = new Map(); // key: `${hostname}:${port}` -> { socket: net.Socket, refCount: number }
 
 // Get or create pooled connection
 function getPooledConnection(proxyUrl, callback) {
@@ -165,7 +181,7 @@ function getPooledConnection(proxyUrl, callback) {
   });
 
   newSocket.on('error', (err) => {
-    proxyPool.delete(key);
+    if (proxyPool.has(key)) proxyPool.delete(key);
     customLog('error', `Pooled connection error for ${key}: ${err.message}`);
     callback(err);
   });
@@ -226,8 +242,11 @@ const httpProxyServer = new ProxyChain.Server({
     let upstreamProxyUrl = proxyList[user.proxyIndex];
     if (!upstreamProxyUrl || !activeProxies.has(upstreamProxyUrl)) {
       // Failover: Find next healthy proxy
-      const healthyIndex = Array.from(activeProxies).findIndex(p => p === proxyList[user.proxyIndex]) + 1;
-      upstreamProxyUrl = Array.from(activeProxies)[healthyIndex % activeProxies.size] || proxyList[0];
+      const healthyList = Array.from(activeProxies);
+      let healthyIndex = healthyList.findIndex(p => p === upstreamProxyUrl);
+      if (healthyIndex === -1) healthyIndex = -1; // If current not healthy, start from 0
+      const nextIndex = (healthyIndex + 1) % healthyList.length;
+      upstreamProxyUrl = healthyList[nextIndex] || healthyList[0];
       if (!upstreamProxyUrl) {
         customLog('error', `[HTTP Proxy] No healthy upstream proxy for user: ${username}`);
         return { responseCode: 503, body: 'No healthy proxies available' };
@@ -295,8 +314,10 @@ socksServer.on('proxyConnect', (info, destination, socket, head) => {
   if (!upstreamProxy || !activeProxies.has(upstreamProxy)) {
     // Failover: Find next healthy
     const healthyList = Array.from(activeProxies);
-    const healthyIndex = healthyList.findIndex(p => p === upstreamProxy);
-    upstreamProxy = healthyList[(healthyIndex + 1) % healthyList.length] || healthyList[0];
+    let healthyIndex = healthyList.findIndex(p => p === upstreamProxy);
+    if (healthyIndex === -1) healthyIndex = -1;
+    const nextIndex = (healthyIndex + 1) % healthyList.length;
+    upstreamProxy = healthyList[nextIndex] || healthyList[0];
     if (!upstreamProxy) {
       customLog('error', `[SOCKS Proxy] No healthy upstream proxy for user: ${user}`);
       socket.end();
@@ -402,7 +423,19 @@ const app = express();
 
 // Basic auth for sensitive endpoints (change credentials!)
 const AUTH_USERS = { admin: 'secretpass' };
-app.use(basicAuth({
+
+// Apply auth to all routes except /metrics and /health (for monitoring)
+app.use('/user_proxies.txt', basicAuth({
+  users: AUTH_USERS,
+  challenge: true,
+  realm: 'Proxy Admin',
+}));
+app.use('/', basicAuth({
+  users: AUTH_USERS,
+  challenge: true,
+  realm: 'Proxy Admin',
+}));
+app.use('/logs', basicAuth({
   users: AUTH_USERS,
   challenge: true,
   realm: 'Proxy Admin',
@@ -432,7 +465,8 @@ app.get('/', async (req, res) => {
   const logPath = path.join(logDir, 'proxy_logs.txt'); // Latest log file
   try {
     const data = await fs.readFile(logPath, 'utf-8');
-    // Tail last 10k chars for performance with large logs
+    // Tail last 
+        // Tail last 10k chars for performance with large logs
     const tailed = data.length > 10000 ? data.slice(-10000) : data;
     res.type('text/plain').send(tailed || 'No logs yet.');
     customLog('info', `Served public logs (tailed) to ${req.ip}`);
@@ -442,7 +476,7 @@ app.get('/', async (req, res) => {
   }
 });
 
-// Alternative logs endpoint (full file, for small logs)
+// Alternative logs endpoint (full file, for small logs, with auth)
 app.get('/logs', async (req, res) => {
   const logPath = path.join(logDir, 'proxy_logs.txt');
   try {
@@ -451,7 +485,28 @@ app.get('/logs', async (req, res) => {
     customLog('info', `Served full logs to ${req.ip}`);
   } catch (err) {
     res.status(404).send('Logs not found');
+    customLog('warn', `Failed to serve full logs: ${err.message}`);
   }
+});
+
+// Separate health check endpoint (JSON response, public for monitoring)
+app.get('/health', (req, res) => {
+  const { details = 'false' } = req.query; // Optional: ?details=true to list healthy proxies
+  const healthStatus = {
+    totalProxies: proxyList.length,
+    healthyProxies: activeProxies.size,
+    healthyPercentage: proxyList.length > 0 ? Math.round((activeProxies.size / proxyList.length) * 100) : 0,
+    lastChecked: new Date().toISOString(), // Approximate; could track exact timestamp
+    status: activeProxies.size > 0 ? 'healthy' : 'degraded'
+  };
+
+  if (details === 'true') {
+    healthStatus.healthyList = Array.from(activeProxies);
+    healthStatus.unhealthyList = proxyList.filter(p => !activeProxies.has(p));
+  }
+
+  res.json(healthStatus);
+  customLog('info', `Health status requested by ${req.ip} (details: ${details})`);
 });
 
 // Metrics endpoint (public, no auth for monitoring tools)
@@ -464,7 +519,9 @@ app.listen(3000, '0.0.0.0', () => {
   customLog('info', 'Public file server running at http://localhost:3000/');
   customLog('info', 'Public logs available at http://localhost:3000/ (with auth)');
   customLog('info', 'Paginated user_proxies.txt at http://localhost:3000/user_proxies.txt?page=1&limit=100 (with auth)');
-  customLog('info', 'Metrics at http://localhost:3000/metrics');
+  customLog('info', 'Full logs at http://localhost:3000/logs (with auth)');
+  customLog('info', 'Health status at http://localhost:3000/health (JSON, public)');
+  customLog('info', 'Metrics at http://localhost:3000/metrics (public)');
 });
 
 // Dynamic proxy reloading (watches proxies.txt for changes)
@@ -474,11 +531,12 @@ chokidar.watch('proxies.txt').on('change', async () => {
   await healthCheck(); // Re-check health after reload
 });
 
-// Initialization
+// Initialization - Load proxies first, then run initial health check
 async function init() {
-  await loadProxies();
-  await healthCheck(); // Initial health check
-  setInterval(healthCheck, 5 * 60 * 1000); // Every 5 minutes
+  await loadProxies(); // Load all proxies
+  customLog('info', 'Proxies loaded, starting initial health check...');
+  await healthCheck(); // Run health check after loading
+  setInterval(healthCheck, 5 * 60 * 1000); // Run periodically every 5 minutes
 }
 
 init().catch(err => {
