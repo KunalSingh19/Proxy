@@ -55,14 +55,13 @@ const IDLE_TIMEOUT = 5 * 60 * 1000; // 5 min idle timeout for pooled connections
 const SCRAPE_SOURCES = [
   'https://api.proxyscrape.com/v2/?request=getproxies&protocol=http&timeout=10000&country=all', // Plain ip:port
   'https://raw.githubusercontent.com/TheSpeedX/PROXY-List/master/http.txt', // Plain ip:port
-  'https://raw.githubusercontent.com/clarketm/proxy-list/master/proxy-list-raw.txt', // Mixed ip:port and protocol
-  'https://raw.githubusercontent.com/monosans/proxy-list/main/proxies/http.txt', // Plain ip:port
   'https://raw.githubusercontent.com/hookzof/socks5_list/master/proxy.txt', // Plain ip:port (HTTP subset)
+  'https://www.proxy-list.download/api/v1/get?type=http', // Plain ip:port
   'https://cdn.jsdelivr.net/gh/proxifly/free-proxy-list@main/proxies/protocols/http/data.txt',
   'https://api.proxyscrape.com/v4/free-proxy-list/get?request=display_proxies&protocol=http&proxy_format=protocolipport&format=text&timeout=20000',
   'https://cdn.jsdelivr.net/gh/mzyui/proxy-list@main/all.txt',
-  'http://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/refs/heads/master/http.txt',
-  'https://raw.githubusercontent.com/ErcinDedeoglu/proxies/refs/heads/main/proxies/http.txt',
+ // 'http://raw.githubusercontent.com/Zaeem20/FREE_PROXIES_LIST/refs/heads/master/http.txt',
+ // 'https://raw.githubusercontent.com/ErcinDedeoglu/proxies/refs/heads/main/proxies/http.txt',
   'https://raw.githubusercontent.com/ErcinDedeoglu/proxies/refs/heads/main/proxies/socks5.txt'
 ];
 
