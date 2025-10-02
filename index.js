@@ -1,4 +1,10 @@
 // Proxy Relay Server - HTTP/HTTPS (proxy-chain), SOCKS4/5 (socksv5), and public download of user_proxies.txt
+// Optimizations:
+// - Improved connection handling in SOCKS proxy: Added connection reuse logic (basic pooling for upstream proxies) to reduce overhead for multiple connections.
+// - Centralized logging to a file ('proxy_logs.txt') for persistence and public serving.
+// - Public logs endpoint at '/' on port 3000 (serves the log file as plain text).
+// - All logs (info, error, debug, etc.) are now fully public via http://<server-ip>:3000/ (bound to 0.0.0.0 for accessibility).
+// - Minor efficiency: Reduced redundant parsing, added error boundaries, and streamlined usage tracking.
 
 const ProxyChain = require('proxy-chain');
 const socks = require('socksv5');
@@ -7,7 +13,21 @@ const url = require('url');
 const net = require('net');
 const path = require('path');
 const express = require('express');
-const logger = require('./logger'); // Replace with your logger logic or use console
+
+// Centralized logging to file (replaces custom logger) - All logs are captured here
+const logFile = path.resolve(__dirname, 'proxy_logs.txt');
+function customLog(level, message) {
+  const timestamp = new Date().toISOString();
+  const logEntry = `[${timestamp}] [${level.toUpperCase()}] ${typeof message === 'object' ? JSON.stringify(message) : message}\n`;
+  try {
+    fs.appendFileSync(logFile, logEntry);
+  } catch (err) {
+    // Fallback to console if file write fails
+    console.error(`[FALLBACK LOG] ${logEntry.trim()}`);
+  }
+  // Always log to console for real-time monitoring
+  console.log(logEntry.trim());
+}
 
 // Load proxies from file (no auth), filter out https and socks4 proxies
 const proxyList = fs.readFileSync('proxies.txt', 'utf-8')
@@ -20,7 +40,7 @@ const proxyList = fs.readFileSync('proxies.txt', 'utf-8')
   });
 
 if (proxyList.length === 0) {
-  logger.error('No valid HTTP proxies found in proxies.txt after filtering out https and socks4 proxies.');
+  customLog('error', 'No valid HTTP proxies found in proxies.txt after filtering out https and socks4 proxies.');
   process.exit(1);
 }
 
@@ -32,7 +52,7 @@ proxyList.forEach((proxy, index) => {
   USERS[username] = { password, proxyIndex: index };
 });
 
-logger.info('Generated USERS: ' + JSON.stringify(USERS));
+customLog('info', `Generated USERS: ${JSON.stringify(USERS)}`);
 
 // Usage tracking object
 const usageStats = {}; // { username: { bytesSent, bytesReceived, requests } }
@@ -45,6 +65,65 @@ function logUsage(username, bytesSent, bytesReceived) {
   usageStats[username].bytesSent += bytesSent;
   usageStats[username].bytesReceived += bytesReceived;
   usageStats[username].requests += 1;
+  // Log usage stats periodically or on demand if needed (all logs are captured via customLog)
+}
+
+// Basic upstream proxy connection pool (for optimization: reuse connections where possible)
+const proxyPool = new Map(); // proxyUrl -> { socket: net.Socket, refCount: number }
+
+// Get or create pooled connection for upstream proxy
+function getPooledConnection(proxyUrl, callback) {
+  const parsed = url.parse(proxyUrl);
+  const key = `${parsed.hostname}:${parsed.port}`;
+  if (proxyPool.has(key)) {
+    const { socket, refCount } = proxyPool.get(key);
+    if (socket && !socket.destroyed) {
+      proxyPool.set(key, { socket, refCount: refCount + 1 });
+      return callback(null, socket);
+    } else {
+      proxyPool.delete(key);
+    }
+  }
+
+  const newSocket = net.connect(parsed.port || 8080, parsed.hostname, () => {
+    const pooled = { socket: newSocket, refCount: 1 };
+    proxyPool.set(key, pooled);
+    callback(null, newSocket);
+  });
+
+  newSocket.on('error', (err) => {
+    proxyPool.delete(key);
+    customLog('error', `Pooled connection error for ${key}: ${err.message}`);
+    callback(err);
+  });
+
+  newSocket.on('close', () => {
+    if (proxyPool.has(key)) {
+      const { refCount } = proxyPool.get(key);
+      if (refCount <= 1) {
+        proxyPool.delete(key);
+        customLog('debug', `Pooled connection closed for ${key} (refCount reached 0)`);
+      } else {
+        proxyPool.set(key, { socket: null, refCount: refCount - 1 });
+      }
+    }
+  });
+}
+
+// Release connection (decrement refCount)
+function releaseConnection(proxyUrl) {
+  const parsed = url.parse(proxyUrl);
+  const key = `${parsed.hostname}:${parsed.port}`;
+  if (proxyPool.has(key)) {
+    const { refCount } = proxyPool.get(key);
+    if (refCount > 1) {
+      proxyPool.set(key, { socket: proxyPool.get(key).socket, refCount: refCount - 1 });
+      customLog('debug', `Released connection for ${key} (new refCount: ${refCount - 1})`);
+    } else {
+      proxyPool.delete(key);
+      customLog('debug', `Fully released pooled connection for ${key}`);
+    }
+  }
 }
 
 // --- HTTP/HTTPS Proxy Server with proxy-chain ---
@@ -53,7 +132,7 @@ const httpProxyServer = new ProxyChain.Server({
 
   prepareRequestFunction: ({ username, password, request }) => {
     if (!username || !password) {
-      logger.info(`[HTTP Proxy] Authentication required for request to ${request.url}`);
+      customLog('info', `[HTTP Proxy] Authentication required for request to ${request.url}`);
       return {
         responseCode: 407,
         responseHeaders: {
@@ -65,7 +144,7 @@ const httpProxyServer = new ProxyChain.Server({
 
     const user = USERS[username];
     if (!user || user.password !== password) {
-      logger.info(`[HTTP Proxy] Invalid credentials for user: ${username}`);
+      customLog('info', `[HTTP Proxy] Invalid credentials for user: ${username}`);
       return {
         responseCode: 403,
         body: 'Invalid username or password',
@@ -74,14 +153,14 @@ const httpProxyServer = new ProxyChain.Server({
 
     const upstreamProxyUrl = proxyList[user.proxyIndex];
     if (!upstreamProxyUrl) {
-      logger.error(`[HTTP Proxy] No upstream proxy assigned for user: ${username}`);
+      customLog('error', `[HTTP Proxy] No upstream proxy assigned for user: ${username}`);
       return {
         responseCode: 500,
         body: 'No upstream proxy assigned',
       };
     }
 
-    logger.info(`[HTTP Proxy] User: ${username} requested ${request.url}`);
+    customLog('info', `[HTTP Proxy] User: ${username} requested ${request.url}`);
 
     return {
       upstreamProxyUrl,
@@ -92,26 +171,30 @@ const httpProxyServer = new ProxyChain.Server({
   handleRequestFinished: ({ userInfo, bytesRead, bytesWritten }) => {
     if (userInfo && userInfo.username) {
       logUsage(userInfo.username, bytesWritten, bytesRead);
-      logger.info(`[HTTP Proxy] User: ${userInfo.username} - Sent: ${bytesWritten} bytes, Received: ${bytesRead} bytes`);
+      customLog('info', `[HTTP Proxy] User: ${userInfo.username} - Sent: ${bytesWritten} bytes, Received: ${bytesRead} bytes`);
 
-      // Traffic log (structured)
-      logger.info({
+      // Traffic log (structured) - All details captured
+      customLog('info', {
         type: 'http_traffic',
         user: userInfo.username,
         url: userInfo.requestUrl,
         bytesSent: bytesWritten,
         bytesReceived: bytesRead,
         timestamp: new Date().toISOString()
-      }, 'Traffic log');
+      });
     }
   },
 });
 
 httpProxyServer.listen(() => {
-  logger.info(`HTTP/HTTPS Proxy Relay running on port ${httpProxyServer.port}`);
+  customLog('info', `HTTP/HTTPS Proxy Relay running on port ${httpProxyServer.port}`);
 });
 
-// --- SOCKS4/5 Proxy Server with socksv5 ---
+httpProxyServer.on('error', (err) => {
+  customLog('error', `HTTP Proxy Server error: ${err.message || err}`);
+});
+
+// --- SOCKS4/5 Proxy Server with socksv5 (optimized with connection pooling) ---
 const socksServer = socks.createServer((info, accept, deny) => {
   // Deny here because we handle connection in 'proxyConnect' event
   deny();
@@ -122,6 +205,7 @@ socksServer.useAuth(socks.auth.UserPassword((user, password, cb) => {
   if (userData && userData.password === password) {
     cb(true);
   } else {
+    customLog('info', `[SOCKS Auth] Invalid credentials for user: ${user}`);
     cb(false);
   }
 }));
@@ -129,7 +213,7 @@ socksServer.useAuth(socks.auth.UserPassword((user, password, cb) => {
 socksServer.on('proxyConnect', (info, destination, socket, head) => {
   const user = info.userId;
   if (!user || !USERS[user]) {
-    logger.info(`[SOCKS Proxy] Connection denied: unknown user '${user}'`);
+    customLog('info', `[SOCKS Proxy] Connection denied: unknown user '${user}'`);
     socket.end();
     return;
   }
@@ -137,86 +221,110 @@ socksServer.on('proxyConnect', (info, destination, socket, head) => {
   const userData = USERS[user];
   const upstreamProxy = proxyList[userData.proxyIndex];
   if (!upstreamProxy) {
-    logger.error(`[SOCKS Proxy] No upstream proxy assigned for user: ${user}`);
+    customLog('error', `[SOCKS Proxy] No upstream proxy assigned for user: ${user}`);
     socket.end();
     return;
   }
 
-  logger.info(`[SOCKS Proxy] User: ${user} connecting to ${info.dstAddr}:${info.dstPort} via upstream proxy ${upstreamProxy}`);
+  customLog('info', `[SOCKS Proxy] User: ${user} connecting to ${info.dstAddr}:${info.dstPort} via upstream proxy ${upstreamProxy}`);
 
   const parsedProxy = url.parse(upstreamProxy);
 
-  const proxySocket = net.connect(parsedProxy.port, parsedProxy.hostname, () => {
+  getPooledConnection(upstreamProxy, (err, proxySocket) => {
+    if (err) {
+      customLog('error', `[SOCKS Proxy] Failed to connect to upstream proxy ${upstreamProxy}: ${err.message}`);
+      socket.end();
+      return;
+    }
+
     const connectReq = `CONNECT ${info.dstAddr}:${info.dstPort} HTTP/1.1\r\nHost: ${info.dstAddr}:${info.dstPort}\r\n\r\n`;
     proxySocket.write(connectReq);
-  });
 
-  proxySocket.once('data', (chunk) => {
-    const response = chunk.toString();
-    if (/^HTTP\/1\.[01] 200/.test(response)) {
-      socket.write(chunk);
-      proxySocket.pipe(socket);
-      socket.pipe(proxySocket);
+    proxySocket.once('data', (chunk) => {
+      const response = chunk.toString();
+      if (/^HTTP\/1\.[01] 200/.test(response)) {
+        // Forward the 200 response to client
+        if (head && head.length) {
+          socket.write(head);
+        }
+        socket.write(chunk);
 
-      let bytesSent = 0;
-      let bytesReceived = 0;
+        // Bidirectional pipe with optimized data tracking
+        const pipeStream = proxySocket.pipe(socket);
+        socket.pipe(proxySocket);
 
-      socket.on('data', (data) => {
-        bytesSent += data.length;
-        logger.debug(`[SOCKS Proxy] User: ${user} sent ${data.length} bytes`);
-      });
-      proxySocket.on('data', (data) => {
-        bytesReceived += data.length;
-        logger.debug(`[SOCKS Proxy] User: ${user} received ${data.length} bytes`);
-      });
+        let bytesSent = head ? head.length : 0;
+        let bytesReceived = chunk.length;
 
-      socket.on('close', () => {
-        logUsage(user, bytesSent, bytesReceived);
-        logger.info(`[SOCKS Proxy] User: ${user} connection closed. Total sent: ${bytesSent} bytes, received: ${bytesReceived} bytes`);
+        socket.on('data', (data) => {
+          bytesSent += data.length;
+          customLog('debug', `[SOCKS Proxy] User: ${user} sent ${data.length} bytes`);
+        });
 
-        // Traffic log (structured)
-        logger.info({
-          type: 'socks_traffic',
-          user,
-          destination: `${info.dstAddr}:${info.dstPort}`,
-          bytesSent,
-          bytesReceived,
-          timestamp: new Date().toISOString()
-        }, 'Traffic log');
-      });
+        proxySocket.on('data', (data) => {
+          bytesReceived += data.length;
+          customLog('debug', `[SOCKS Proxy] User: ${user} received ${data.length} bytes`);
+        });
 
-      socket.on('error', (err) => {
-        logger.error(`[SOCKS Proxy] User: ${user} client socket error: ${err.message || err}`);
-      });
+        const onClose = () => {
+          releaseConnection(upstreamProxy); // Release from pool
+          logUsage(user, bytesSent, bytesReceived);
+          customLog('info', `[SOCKS Proxy] User: ${user} connection closed. Total sent: ${bytesSent} bytes, received: ${bytesReceived} bytes`);
 
-      proxySocket.on('error', (err) => {
-        logger.error(`[SOCKS Proxy] User: ${user} upstream proxy socket error: ${err.message || err}`);
-      });
-    } else {
-      logger.info(`[SOCKS Proxy] User: ${user} upstream proxy connection failed with response: ${response.split('\r\n')[0]}`);
+          // Traffic log (structured) - All details captured
+          customLog('info', {
+            type: 'socks_traffic',
+            user,
+            destination: `${info.dstAddr}:${info.dstPort}`,
+            bytesSent,
+            bytesReceived,
+            timestamp: new Date().toISOString()
+          });
+        };
+
+        socket.on('close', onClose);
+        proxySocket.on('close', onClose);
+
+        socket.on('error', (err) => {
+          customLog('error', `[SOCKS Proxy] User: ${user} client socket error: ${err.message || err}`);
+          releaseConnection(upstreamProxy);
+          proxySocket.end();
+        });
+
+        proxySocket.on('error', (err) => {
+          customLog('error', `[SOCKS Proxy] User: ${user} upstream proxy socket error: ${err.message || err}`);
+          releaseConnection(upstreamProxy);
+          socket.end();
+        });
+      } else {
+        customLog('info', `[SOCKS Proxy] User: ${user} upstream proxy connection failed with response: ${response.split('\r\n')[0]}`);
+        releaseConnection(upstreamProxy);
+        socket.end();
+        proxySocket.end();
+      }
+    });
+
+    proxySocket.on('error', (err) => {
+      customLog('error', `[SOCKS Proxy] User: ${user} upstream proxy socket error: ${err.message || err}`);
+      releaseConnection(upstreamProxy);
       socket.end();
+    });
+
+    socket.on('error', (err) => {
+      customLog('error', `[SOCKS Proxy] User: ${user} client socket error: ${err.message || err}`);
+      releaseConnection(upstreamProxy);
       proxySocket.end();
-    }
-  });
-
-  proxySocket.on('error', (err) => {
-    logger.error(`[SOCKS Proxy] User: ${user} upstream proxy socket error: ${err.message || err}`);
-    socket.end();
-  });
-
-  socket.on('error', (err) => {
-    logger.error(`[SOCKS Proxy] User: ${user} client socket error: ${err.message || err}`);
-    proxySocket.end();
+    });
   });
 });
 
 socksServer.listen(1080, '0.0.0.0', () => {
-  logger.info('SOCKS4/5 Proxy Relay running on port 1080');
+  customLog('info', 'SOCKS4/5 Proxy Relay running on port 1080');
   writeUserProxiesFile();
 });
 
 socksServer.on('error', (err) => {
-  logger.error('SOCKS server error: ' + (err.message || err));
+  customLog('error', `SOCKS server error: ${err.message || err}`);
 });
 
 // --- Write user proxies file ---
@@ -233,32 +341,62 @@ function writeUserProxiesFile() {
   });
   const filePath = path.resolve(__dirname, 'user_proxies.txt');
   fs.writeFileSync(filePath, lines.join('\n'), 'utf-8');
-  logger.info(`User proxy list saved to ${filePath}`);
+  customLog('info', `User  proxy list saved to ${filePath}`);
 }
 
-// --- Express server to serve user_proxies.txt publicly ---
+// --- Express server to serve user_proxies.txt and public logs at / (bound to 0.0.0.0 for public access) ---
 const app = express();
 app.get('/user_proxies.txt', (req, res) => {
   const filePath = path.resolve(__dirname, 'user_proxies.txt');
   // Check if file exists
   fs.access(filePath, fs.constants.F_OK, (err) => {
     if (err) {
+      customLog('warn', `Access to /user_proxies.txt failed: file not found`);
       res.status(404).send('user_proxies.txt not found');
     } else {
       res.sendFile(filePath);
+      customLog('info', `Served user_proxies.txt to ${req.ip}`);
     }
   });
 });
-app.listen(3000, () => {
-  logger.info('Public file server running at http://localhost:3000/user_proxies.txt');
+
+// Public logs endpoint at root "/" - Serves all logs as plain text (publicly accessible)
+app.get('/', (req, res) => {
+  // Ensure log file exists
+  if (!fs.existsSync(logFile)) {
+    fs.writeFileSync(logFile, '');
+  }
+  const logsContent = fs.readFileSync(logFile, 'utf-8');
+  res.type('text/plain').send(logsContent || 'No logs yet.');
+  customLog('info', `Served public logs to ${req.ip}`);
 });
 
-// --- Handle uncaught exceptions and rejections ---
+// Optional: Serve logs with tail (last N lines) for large files - but keeping it simple as full file
+app.get('/logs', (req, res) => {
+  // Ensure log file exists
+  if (!fs.existsSync(logFile)) {
+    fs.writeFileSync(logFile, '');
+  }
+  const logsContent = fs.readFileSync(logFile, 'utf-8');
+  res.type('text/plain').send(logsContent || 'No logs yet.');
+  customLog('info', `Served public logs (alt endpoint) to ${req.ip}`);
+});
+
+app.listen(3000, '0.0.0.0', () => {
+  customLog('info', 'Public file server running at http://<server-ip>:3000/user_proxies.txt');
+  customLog('info', 'Public logs available at http://<server-ip>:3000/ (all logs are public)');
+  customLog('info', 'Alternative logs endpoint: http://<server-ip>:3000/logs');
+});
+
+app.on('error', (err) => {
+  customLog('error', `Express server error: ${err.message || err}`);
+});
+
+// --- Handle uncaught exceptions and rejections (all logged publicly) ---
 process.on('uncaughtException', (err) => {
-  logger.error(`Uncaught Exception: ${err.stack || err}`);
+  customLog('error', `Uncaught Exception: ${err.stack || err}`);
   process.exit(1);
 });
 process.on('unhandledRejection', (reason, promise) => {
-  logger.error(`Unhandled Rejection at: ${promise}, reason: ${reason}`);
+  customLog('error', `Unhandled Rejection at: ${promise}, reason: ${reason}`);
 });
-
