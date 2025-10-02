@@ -27,7 +27,7 @@ if (proxyList.length === 0) {
 // Dynamically generate USERS object based on proxies
 const USERS = {};
 proxyList.forEach((proxy, index) => {
-  const username = `user${index + 1}`;
+  const username = `kevin${index + 1}`;
   const password = `pass${index + 1}`;
   USERS[username] = { password, proxyIndex: index };
 });
@@ -261,3 +261,4 @@ process.on('uncaughtException', (err) => {
 process.on('unhandledRejection', (reason, promise) => {
   logger.error(`Unhandled Rejection at: ${promise}, reason: ${reason}`);
 });
+
