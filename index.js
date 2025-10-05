@@ -1,4 +1,4 @@
-// Proxy Relay Server - Ultra-Fast Startup for Render.com (No Initial Delays)
+// Proxy Relay Server - Ultra-Fast Startup for Render.com (Fixed Route Path)
 // Features:
 // - Instant server start (<2s); proxies loaded async after.
 // - No health check on startup; delayed/batched periodic checks only.
@@ -196,7 +196,7 @@ app.get('/metrics', async (req, res) => {
   customLog('info', 'Metrics served');
 });
 
-// Auth middleware for proxy
+// Auth middleware for proxy (prefix /proxy)
 app.use('/proxy', (req, res, next) => {
   const auth = req.headers.authorization;
   if (!auth || !auth.startsWith('Basic ')) {
@@ -213,8 +213,8 @@ app.use('/proxy', (req, res, next) => {
   next();
 });
 
-// Proxy forwarder (lightweight)
-app.all('/proxy/*', async (req, res) => {
+// Proxy forwarder (fixed route: /proxy/:target* for catch-all)
+app.all('/proxy/:target*', async (req, res) => {
   const { username, userIndex } = req.proxyUser ;
   if (!username) return res.status(401).send('Unauthorized');
 
@@ -232,14 +232,14 @@ app.all('/proxy/*', async (req, res) => {
 
   try {
     const parsed = url.parse(upstream);
-    const target = req.originalUrl.replace('/proxy', '');
+    const target = req.originalUrl.replace('/proxy', ''); // Full target from original URL
     const proxyReq = await axios({
       method: req.method,
       url: target,
       proxy: {
         host: parsed.hostname,
         port: parsed.port || 8080,
-        protocol: parsed.protocol.replace(':', '')
+        protocol: parsed.protocol.replace(':', '') // e.g., 'http'
       },
       headers: req.headers,
       data: req.body,
