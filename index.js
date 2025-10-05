@@ -152,7 +152,7 @@ async function healthCheck() {
 }
 
 // Write user proxies file (async) - Now uses the helper for consistency
-async function writeUser ProxiesFile() {
+async function writeUserProxiesFile() {
   const lines = getHealthyRelayedProxiesList();
   const filePath = path.resolve(__dirname, 'user_proxies.txt');
   await fs.writeFile(filePath, lines.join('\n'), 'utf-8');
