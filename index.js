@@ -5,7 +5,7 @@
 // - Separate /health endpoint to view/report health status (JSON response with healthy/total counts).
 // - Centralized logging with rotation (rotating-file-stream) - All logs public via /logs.
 // - Connection pooling for upstream proxies (basic Map-based with limits).
-// - Usage tracking and metrics (prom-client) exposed at /metrics.
+// - Usage tracking and metrics (prom-client) exposed at /metrics (includes healthy relayed proxies list as comments).
 // - Public endpoints for user_proxies.txt and logs (no auth, no pagination).
 // - Async file I/O for better performance.
 // - Error recovery and structured logging.
@@ -45,11 +45,11 @@ function customLog(level, message) {
 // Global variables
 let proxyList = [];
 let USERS = {};
-let activeProxies = new Set(); // Healthy proxies
+let activeProxies = new Set(); // Healthy upstream proxies
 const usageStats = {}; // { username: { bytesSent, bytesReceived, requests } }
 
 // Metrics
-const healthyProxiesGauge = new client.Gauge({ name: 'healthy_proxies_total', help: 'Total healthy proxies' });
+const healthyProxiesGauge = new client.Gauge({ name: 'healthy_proxies_total', help: 'Total healthy upstream proxies' });
 const totalRequestsCounter = new client.Counter({ name: 'total_requests', help: 'Total proxy requests' });
 
 // Helper to log usage
@@ -61,6 +61,19 @@ function logUsage(username, bytesSent, bytesReceived) {
   usageStats[username].bytesReceived += bytesReceived;
   usageStats[username].requests += 1;
   totalRequestsCounter.inc();
+}
+
+// Function to generate healthy relayed (user-facing) proxy list
+function getHealthyRelayedProxiesList() {
+  const lines = [];
+  Object.entries(USERS).forEach(([username, { password, proxyIndex }]) => {
+    const upstreamProxy = proxyList[proxyIndex];
+    if (!upstreamProxy || !activeProxies.has(upstreamProxy)) return; // Skip unhealthy upstreams
+    const parsed = url.parse(upstreamProxy);
+    const line = `${parsed.protocol}//${encodeURIComponent(username)}:${encodeURIComponent(password)}@${parsed.host}`;
+    lines.push(line);
+  });
+  return lines;
 }
 
 // Load proxies (async, with filtering)
@@ -134,21 +147,16 @@ async function healthCheck() {
   activeProxies = healthy;
   healthyProxiesGauge.set(healthy.size);
   customLog('info', `Health check completed: ${healthy.size}/${proxyList.length} healthy proxies`);
+
+  await writeUserProxiesFile(); // Update user proxies after health check
 }
 
-// Write user proxies file (async)
+// Write user proxies file (async) - Now uses the helper for consistency
 async function writeUser ProxiesFile() {
-  const lines = [];
-  Object.entries(USERS).forEach(([username, { password, proxyIndex }]) => {
-    const upstreamProxy = proxyList[proxyIndex];
-    if (!upstreamProxy || !activeProxies.has(upstreamProxy)) return; // Skip unhealthy
-    const parsed = url.parse(upstreamProxy);
-    const line = `${parsed.protocol}//${encodeURIComponent(username)}:${encodeURIComponent(password)}@${parsed.host}`;
-    lines.push(line);
-  });
+  const lines = getHealthyRelayedProxiesList();
   const filePath = path.resolve(__dirname, 'user_proxies.txt');
   await fs.writeFile(filePath, lines.join('\n'), 'utf-8');
-  customLog('info', `User   proxy list saved to ${filePath} (${lines.length} entries)`);
+  customLog('info', `User  proxy list saved to ${filePath} (${lines.length} entries)`);
 }
 
 // Basic upstream proxy connection pool (Map-based, with refCount limits)
@@ -461,7 +469,6 @@ app.get('/logs', async (req, res) => {
 });
 
 // Separate health check endpoint (JSON response, public for monitoring)
-// Separate health check endpoint (JSON response, public for monitoring)
 app.get('/health', (req, res) => {
   const { details = 'false' } = req.query; // Optional: ?details=true to list healthy proxies
   const healthStatus = {
@@ -481,27 +488,29 @@ app.get('/health', (req, res) => {
   customLog('info', `Health status requested by ${req.ip} (details: ${details})`);
 });
 
-// Metrics endpoint (public, no auth for monitoring tools) - Enhanced with healthy proxy list as comments
+// Metrics endpoint (public, no auth for monitoring tools) - Includes healthy relayed proxies list as comments
 app.get('/metrics', async (req, res) => {
   const metrics = await client.register.metrics();
-  const healthyList = Array.from(activeProxies);
-  const healthyListComment = healthyList.length > 0 
-    ? `# Healthy Proxies List:\n${healthyList.join('\n')}\n\n`
-    : '# No healthy proxies\n\n';
+  const healthyRelayedList = getHealthyRelayedProxiesList();
+  const listComment = healthyRelayedList.length > 0 
+    ? `# Healthy Relayed Proxies List (user-facing, generated at ${new Date().toISOString()}):\n${healthyRelayedList.map(line => `# ${line}`).join('\n')}\n\n`
+    : `# No healthy relayed proxies available (as of ${new Date().toISOString()})\n\n`;
   
-  const enhancedMetrics = `${healthyListComment}${metrics}`;
+  const enhancedMetrics = `${listComment}${metrics}`;
   
   res.set('Content-Type', client.register.contentType);
   res.end(enhancedMetrics);
 });
 
-app.listen(3000, '0.0.0.0', () => {
+// Start Express server and capture the server instance for graceful shutdown
+let expressServer;
+expressServer = app.listen(3000, '0.0.0.0', () => {
   customLog('info', 'Public file server running at http://localhost:3000/');
   customLog('info', 'Public logs available at http://localhost:3000/ (tailed)');
   customLog('info', 'Full logs at http://localhost:3000/logs');
   customLog('info', 'Full user_proxies.txt at http://localhost:3000/user_proxies.txt');
   customLog('info', 'Health status at http://localhost:3000/health (JSON, public)');
-  customLog('info', 'Metrics at http://localhost:3000/metrics (public, includes healthy proxy list as comments)');
+  customLog('info', 'Metrics at http://localhost:3000/metrics (public, includes healthy relayed proxies list as comments)');
 });
 
 // Dynamic proxy reloading (watches proxies.txt for changes)
@@ -509,7 +518,6 @@ chokidar.watch('proxies.txt').on('change', async () => {
   customLog('info', 'proxies.txt changed, reloading...');
   await loadProxies();
   await healthCheck(); // Re-check health after reload
-  await writeUserProxiesFile(); // Update user proxies after reload
 });
 
 // Initialization - Load proxies first, then run initial health check
@@ -540,7 +548,7 @@ process.on('SIGINT', () => {
   customLog('info', 'SIGINT received, shutting down gracefully');
   httpProxyServer.close(() => {});
   socksServer.close(() => {});
-  app.close(() => {}); // Close express server
+  if (expressServer) expressServer.close(() => {});
   process.exit(0);
 });
 
@@ -548,6 +556,6 @@ process.on('SIGTERM', () => {
   customLog('info', 'SIGTERM received, shutting down gracefully');
   httpProxyServer.close(() => {});
   socksServer.close(() => {});
-  app.close(() => {}); // Close express server
+  if (expressServer) expressServer.close(() => {});
   process.exit(0);
 });
