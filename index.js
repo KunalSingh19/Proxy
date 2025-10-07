@@ -43,7 +43,7 @@ function getPublicIP(callback) {
 const userCredentials = new Map();
 function generateUsers() {
   const users = [];
-  for (let i = 1; i <= 100; i++) {
+  for (let i = 1; i <= 50; i++) {
     const firstNames = ['Alice', 'Bob', 'Charlie', 'Diana', 'Eve', 'Frank', 'Grace', 'Henry', 'Ivy', 'Jack'];
     const lastNames = ['Smith', 'Johnson', 'Williams', 'Brown', 'Jones', 'Garcia', 'Miller', 'Davis', 'Rodriguez', 'Martinez'];
     const first = firstNames[Math.floor(Math.random() * firstNames.length)];
