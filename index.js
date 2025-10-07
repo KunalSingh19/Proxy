@@ -3,8 +3,41 @@ const url = require('url');
 const crypto = require('crypto'); // For base64 decoding in auth
 
 const PROXY_PORT = process.env.PORT || 8080; // Render uses PORT env var
-const PROXY_HOST = process.env.RENDER_EXTERNAL_HOSTNAME || 'localhost'; // Render domain or fallback
+const PROXY_DOMAIN = process.env.RENDER_EXTERNAL_HOSTNAME || 'localhost'; // Render domain
 const TIMEOUT = 10000; // 10s timeout for requests
+let cachedIP = null;
+let cacheExpiry = 0; // For 5-min cache
+const CACHE_DURATION = 5 * 60 * 1000; // 5 minutes
+
+// Function to detect public IP (async)
+function getPublicIP(callback) {
+  if (cachedIP && Date.now() < cacheExpiry) {
+    return callback(null, cachedIP);
+  }
+
+  const req = http.request('http://api.ipify.org?format=text', (res) => {
+    let data = '';
+    res.on('data', (chunk) => data += chunk);
+    res.on('end', () => {
+      if (data.trim().match(/^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$/)) { // Validate IP
+        cachedIP = data.trim();
+        cacheExpiry = Date.now() + CACHE_DURATION;
+        console.log(`Detected public IP: ${cachedIP}`);
+        callback(null, cachedIP);
+      } else {
+        callback(new Error('Invalid IP response'), PROXY_DOMAIN); // Fallback to domain
+      }
+    });
+  });
+
+  req.on('error', (err) => {
+    console.error('IP detection error:', err.message);
+    callback(err, '127.0.0.1'); // Fallback to localhost
+  });
+
+  req.setTimeout(5000, () => req.destroy()); // 5s timeout for IP fetch
+  req.end();
+}
 
 // In-memory storage for 100 users' credentials (generated on startup for speed)
 const userCredentials = new Map();
@@ -57,11 +90,23 @@ const server = http.createServer((req, res) => {
   // Handle special /users endpoint (direct plain text response, no proxying, no auth)
   if (req.url === '/users' && req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
-    const users = generateUsers(); // Regenerate for freshness (or use pre-generated)
-    const output = users.map(user => 
-      `http://${user.username}:${user.password}@${PROXY_HOST}` // No port in URL (Render uses 443/80 externally)
-    ).join('\n');
-    res.end(output + '\n'); // One line per user, with trailing newline
+    
+    getPublicIP((err, publicIP) => {
+      if (err) {
+        res.end(`Error detecting IP: ${err.message}\nUsing domain fallback.\n\n`);
+        return;
+      }
+      
+      const users = generateUsers(); // Regenerate for freshness
+      let output = '';
+      users.forEach(user => {
+        // Domain version (no port)
+        output += `http://${user.username}:${user.password}@${PROXY_DOMAIN}\n`;
+        // IP version (with port)
+        output += `http://${user.username}:${user.password}@${publicIP}:${PROXY_PORT}\n`;
+      });
+      res.end(output + '\n'); // Two lines per user
+    });
     return;
   }
 
@@ -131,12 +176,17 @@ const server = http.createServer((req, res) => {
   });
 });
 
-// Start the server (bind to 0.0.0.0 for Render)
+// Start the server (bind to 0.0.0.0 for Render) and detect IP on startup
 server.listen(PROXY_PORT, '0.0.0.0', () => {
-  console.log(`HTTP-only proxy server with basic auth and /users endpoint running on ${PROXY_HOST}:${PROXY_PORT}`);
-  console.log('Access users (plain text): https://${PROXY_HOST}/users'); // Render uses HTTPS externally
-  console.log('Example proxy with auth: curl -x http://${PROXY_HOST} -U user1:pass1 http://httpbin.org/ip');
-  console.log('Supports 100 unique users with credentials. Handles concurrent requests efficiently (free tier limits apply).');
+  console.log(`HTTP-only proxy server starting on ${PROXY_DOMAIN}:${PROXY_PORT}`);
+  getPublicIP((err, ip) => {
+    if (!err) {
+      console.log(`Detected public IP: ${ip}`);
+    }
+    console.log('Access users (plain text with IP/domain): https://${PROXY_DOMAIN}/users');
+    console.log('Example proxy with auth: curl -x http://${PROXY_DOMAIN} -U user1:pass1 http://httpbin.org/ip');
+    console.log('Supports 100 unique users. Handles concurrent requests efficiently (free tier limits apply).');
+  });
 });
 
 // Graceful shutdown
