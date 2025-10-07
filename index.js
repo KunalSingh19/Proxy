@@ -1,309 +1,148 @@
-// Proxy Relay Server - Ultra-Fast Startup for Render.com (Fixed Route Path)
-// Features:
-// - Instant server start (<2s); proxies loaded async after.
-// - No health check on startup; delayed/batched periodic checks only.
-// - HTTP Proxy Relay via Express + lightweight axios forwarding.
-// - /metrics with healthy relayed proxies list (comments).
-// - Env-based; console logs only.
-// Dependencies: Same as before.
-
+const http = require('http');
 const url = require('url');
-const express = require('express');
-const axios = require('axios');
-const client = require('prom-client');
+const crypto = require('crypto'); // For base64 decoding in auth
 
-// Console logging (minimal for speed)
-function customLog(level, message) {
-  const timestamp = new Date().toISOString();
-  const logEntry = `[${timestamp}] [${level.toUpperCase()}] ${typeof message === 'object' ? JSON.stringify(message) : message}`;
-  console.log(logEntry);
-}
+const PROXY_PORT = 8080;
+const TIMEOUT = 10000; // 10s timeout for requests
+const PROXY_HOST = '127.0.0.1'; // Actual IP (change to your server's IP if remote)
 
-// Globals
-let proxyList = [];
-let USERS = {};
-let activeProxies = new Set();
-const usageStats = {};
-let isInitialized = false;
-
-// Metrics
-const healthyProxiesGauge = new client.Gauge({ name: 'healthy_proxies_total', help: 'Total healthy upstream proxies' });
-const totalRequestsCounter = new client.Counter({ name: 'total_requests', help: 'Total proxy requests' });
-
-// Env config
-const HEALTH_CHECK_ENABLED = process.env.HEALTH_CHECK_ENABLED !== 'false';
-const SKIP_INITIAL_HEALTH = process.env.SKIP_INITIAL_HEALTH !== 'false';
-const BATCH_SIZE = parseInt(process.env.HEALTH_CHECK_BATCH_SIZE) || 100;
-const INITIAL_HEALTH_DELAY = parseInt(process.env.INITIAL_HEALTH_DELAY) || 30000; // 30s
-
-// Log usage
-function logUsage(username, bytesSent, bytesReceived) {
-  if (!usageStats[username]) {
-    usageStats[username] = { bytesSent: 0, bytesReceived: 0, requests: 0 };
-  }
-  usageStats[username].bytesSent += bytesSent;
-  usageStats[username].bytesReceived += bytesReceived;
-  usageStats[username].requests += 1;
-  totalRequestsCounter.inc();
-}
-
-// Generate healthy relayed proxies list
-function getHealthyRelayedProxiesList() {
-  const lines = [];
-  Object.entries(USERS).forEach(([username, { password, proxyIndex }]) => {
-    const upstreamProxy = proxyList[proxyIndex];
-    if (!upstreamProxy || !activeProxies.has(upstreamProxy)) return;
-    const parsed = url.parse(upstreamProxy);
-    const line = `${parsed.protocol}//${encodeURIComponent(username)}:${encodeURIComponent(password)}@${parsed.host}`;
-    lines.push(line);
-  });
-  return lines;
-}
-
-// Load proxies (fast env parse)
-async function loadProxies() {
-  try {
-    const proxiesEnv = process.env.PROXIES_LIST || '';
-    if (!proxiesEnv) {
-      customLog('warn', 'No PROXIES_LIST; no proxies loaded.');
-      return;
-    }
-
-    proxyList = proxiesEnv.split('\n')
-      .map(line => line.trim())
-      .filter(line => line.length > 0)
-      .filter(line => {
-        const lower = line.toLowerCase();
-        return !lower.startsWith('https://') && !lower.startsWith('socks4://');
-      });
-
-    if (proxyList.length === 0) {
-      customLog('warn', 'No valid proxies in PROXIES_LIST.');
-      return;
-    }
-
-    USERS = {};
-    proxyList.forEach((proxy, index) => {
-      const username = `kevin${index + 1}`;
-      const password = `pass${index + 1}`;
-      USERS[username] = { password, proxyIndex: index };
+// In-memory storage for 100 users' credentials (generated on startup for speed)
+const userCredentials = new Map();
+function generateUsers() {
+  const users = [];
+  for (let i = 1; i <= 100; i++) {
+    const firstNames = ['Alice', 'Bob', 'Charlie', 'Diana', 'Eve', 'Frank', 'Grace', 'Henry', 'Ivy', 'Jack'];
+    const lastNames = ['Smith', 'Johnson', 'Williams', 'Brown', 'Jones', 'Garcia', 'Miller', 'Davis', 'Rodriguez', 'Martinez'];
+    const first = firstNames[Math.floor(Math.random() * firstNames.length)];
+    const last = lastNames[Math.floor(Math.random() * lastNames.length)];
+    const fullName = `${first} ${last}`;
+    const email = `${fullName.toLowerCase().replace(' ', '.')}@example.com`;
+    const age = Math.floor(Math.random() * 48) + 18; // 18-65
+    const username = `user${i}`;
+    const password = `pass${i}`;
+    
+    // Store credentials for auth validation
+    userCredentials.set(username, password);
+    
+    users.push({
+      id: i,
+      name: fullName,
+      email: email,
+      age: age,
+      username: username,
+      password: password
     });
-
-    activeProxies = new Set(proxyList); // All healthy initially
-    healthyProxiesGauge.set(proxyList.length);
-
-    customLog('info', `Loaded ${proxyList.length} proxies, ${Object.keys(USERS).length} users.`);
-  } catch (err) {
-    customLog('error', `Load proxies failed: ${err.message}`);
   }
+  return users;
 }
 
-// Fast batched health check (no logs per proxy)
-async function healthCheck() {
-  if (!HEALTH_CHECK_ENABLED || proxyList.length === 0) {
+// Generate users on startup (pre-populates credentials)
+generateUsers();
+
+// Function to validate basic proxy auth
+function validateProxyAuth(req) {
+  const authHeader = req.headers['proxy-authorization'];
+  if (!authHeader || !authHeader.startsWith('Basic ')) {
+    return false;
+  }
+  
+  const credentials = Buffer.from(authHeader.split(' ')[1], 'base64').toString('utf8');
+  const [username, password] = credentials.split(':');
+  
+  return userCredentials.has(username) && userCredentials.get(username) === password;
+}
+
+// Create the HTTP-only proxy server
+const server = http.createServer((req, res) => {
+  // Handle special /users endpoint (direct plain text response, no proxying, no auth)
+  if (req.url === '/users' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'text/plain' });
+    const users = generateUsers(); // Regenerate for freshness (or use pre-generated)
+    const output = users.map(user => 
+      `http://${user.username}:${user.password}@${PROXY_HOST}:${PROXY_PORT}`
+    ).join('\n');
+    res.end(output + '\n'); // One line per user, with trailing newline
     return;
   }
 
-  customLog('info', `Batched health check starting (${BATCH_SIZE}/batch)...`);
-  const healthy = new Set();
-  const batches = [];
-  for (let i = 0; i < proxyList.length; i += BATCH_SIZE) {
-    batches.push(proxyList.slice(i, i + BATCH_SIZE));
-  }
-
-  for (let b = 0; b < batches.length; b++) {
-    const batch = batches[b];
-    const checks = batch.map(async (proxyUrl) => {
-      try {
-        const parsed = url.parse(proxyUrl);
-        await axios.get('http://httpbin.org/ip', {
-          proxy: { host: parsed.hostname, port: parsed.port || 8080 },
-          timeout: 2000  // 2s for ultra-speed
-        });
-        return proxyUrl;
-      } catch {
-        return null; // Silent fail
-      }
+  // Require proxy auth for all proxy requests
+  if (!validateProxyAuth(req)) {
+    res.writeHead(407, {
+      'Proxy-Authenticate': 'Basic realm="Proxy Access"',
+      'Content-Type': 'text/plain'
     });
-
-    const results = await Promise.allSettled(checks);
-    results.forEach(result => {
-      if (result.status === 'fulfilled' && result.value) {
-        healthy.add(result.value);
-      }
-    });
-
-    if (b < batches.length - 1) {
-      await new Promise(r => setTimeout(r, 100)); // Quick batch delay
-    }
+    res.end('HTTP/1.1 407 Proxy Authentication Required\r\n\r\nProvide valid credentials.');
+    return;
   }
 
-  activeProxies = healthy;
-  healthyProxiesGauge.set(healthy.size);
-  customLog('info', `Health check done: ${healthy.size}/${proxyList.length} healthy.`);
-}
-
-// --- Express App ---
-const app = express();
-app.use(express.json());
-
-// Instant ready endpoint
-app.get('/ready', (req, res) => {
-  res.json({ status: 'ready', initialized: isInitialized, healthy: activeProxies.size });
-});
-
-// User proxies endpoint
-app.get('/user_proxies', (req, res) => {
-  const format = req.query.format || 'text';
-  const list = getHealthyRelayedProxiesList();
-  if (format === 'json') {
-    res.json({ proxies: list, count: list.length, time: new Date().toISOString() });
-  } else {
-    res.type('text/plain').send(list.join('\n') || 'No healthy proxies.');
+  // Only support HTTP methods for HTTP URLs (proxying)
+  if (req.method === 'CONNECT') {
+    // Reject HTTPS tunneling (HTTP-only proxy)
+    res.writeHead(501, { 'Content-Type': 'text/plain' });
+    res.end('HTTP/1.1 501 Not Implemented\r\n\r\nThis proxy supports HTTP only. HTTPS tunneling not available.');
+    return;
   }
-  customLog('info', `User  proxies served (${format}): ${list.length}`);
-});
 
-// Health endpoint
-app.get('/health', (req, res) => {
-  const details = req.query.details === 'true';
-  const status = {
-    total: proxyList.length,
-    healthy: activeProxies.size,
-    percentage: proxyList.length > 0 ? Math.round((activeProxies.size / proxyList.length) * 100) : 0,
-    time: new Date().toISOString(),
-    status: activeProxies.size > 0 ? 'healthy' : 'degraded',
-    initialized: isInitialized
+  // Parse the target URL (expects full URL in req.url, e.g., http://example.com/path)
+  const parsedUrl = url.parse(req.url);
+  if (!parsedUrl.protocol || parsedUrl.protocol !== 'http:') {
+    res.writeHead(400, { 'Content-Type': 'text/plain' });
+    res.end('Bad Request: Only HTTP URLs supported.');
+    return;
+  }
+
+  const options = {
+    hostname: parsedUrl.hostname,
+    port: parsedUrl.port || 80,
+    path: parsedUrl.path,
+    method: req.method,
+    headers: req.headers
   };
-  if (details) {
-    status.healthyList = Array.from(activeProxies);
-    status.unhealthyList = proxyList.filter(p => !activeProxies.has(p));
-  }
-  res.json(status);
-  customLog('info', `Health requested (details: ${details})`);
-});
+  // Remove proxy-specific headers before forwarding
+  delete options.headers['proxy-authorization'];
 
-// Metrics with relayed list
-app.get('/metrics', async (req, res) => {
-  const metrics = await client.register.metrics();
-  const list = getHealthyRelayedProxiesList();
-  let comment = `# No healthy relayed proxies (as of ${new Date().toISOString()})\n\n`;
-  if (list.length > 0) {
-    comment = `# Healthy Relayed Proxies List (user-facing, ${new Date().toISOString()}):\n${list.map(line => `# ${line}`).join('\n')}\n\n`;
-  }
-  res.set('Content-Type', client.register.contentType);
-  res.end(`${comment}${metrics}`);
-  customLog('info', 'Metrics served');
-});
+  // Forward the HTTP request
+  const proxyReq = http.request(options, (proxyRes) => {
+    // Copy response headers (filter out hop-by-hop headers for cleanliness)
+    const headers = { ...proxyRes.headers };
+    delete headers.connection;
+    delete headers['proxy-connection'];
+    delete headers['keep-alive'];
 
-// Auth middleware for proxy (prefix /proxy)
-app.use('/proxy', (req, res, next) => {
-  const auth = req.headers.authorization;
-  if (!auth || !auth.startsWith('Basic ')) {
-    res.set('Proxy-Authenticate', 'Basic realm="Proxy Relay"');
-    return res.status(407).send('Auth required');
-  }
-  const creds = Buffer.from(auth.split(' ')[1], 'base64').toString().split(':');
-  const [username, password] = creds;
-  const user = USERS[username];
-  if (!user || user.password !== password) {
-    return res.status(403).send('Invalid creds');
-  }
-  req.proxyUser  = { username, userIndex: user.proxyIndex };
-  next();
-});
+    res.writeHead(proxyRes.statusCode, headers);
+    proxyRes.pipe(res, { end: true });
+  });
 
-// Proxy forwarder (fixed route: /proxy/:target* for catch-all)
-app.all('/proxy/:target*', async (req, res) => {
-  const { username, userIndex } = req.proxyUser ;
-  if (!username) return res.status(401).send('Unauthorized');
+  // Pipe request body and headers
+  req.pipe(proxyReq, { end: true });
 
-  let upstream = proxyList[userIndex];
-  if (!upstream || !activeProxies.has(upstream)) {
-    const healthyList = Array.from(activeProxies);
-    let idx = healthyList.findIndex(p => p === upstream);
-    if (idx === -1) idx = -1;
-    const nextIdx = (idx + 1) % healthyList.length;
-    upstream = healthyList[nextIdx] || healthyList[0];
-    if (!upstream) return res.status(503).send('No healthy proxies');
-  }
+  // Handle proxy request errors
+  proxyReq.on('error', (err) => {
+    console.error('Proxy request error:', err.message);
+    res.writeHead(500, { 'Content-Type': 'text/plain' });
+    res.end('Proxy Error: Unable to connect to target server.');
+  });
 
-  customLog('info', `[Proxy] ${username} -> ${req.originalUrl} via ${upstream}`);
-
-  try {
-    const parsed = url.parse(upstream);
-    const target = req.originalUrl.replace('/proxy', ''); // Full target from original URL
-    const proxyReq = await axios({
-      method: req.method,
-      url: target,
-      proxy: {
-        host: parsed.hostname,
-        port: parsed.port || 8080,
-        protocol: parsed.protocol.replace(':', '') // e.g., 'http'
-      },
-      headers: req.headers,
-      data: req.body,
-      timeout: 30000,
-      responseType: 'arraybuffer'
-    });
-
-    const bytesSent = req.body ? Buffer.byteLength(req.body) : 0;
-    const bytesRecv = proxyReq.data ? proxyReq.data.length : 0;
-    logUsage(username, bytesSent, bytesRecv);
-
-    res.status(proxyReq.status);
-    Object.entries(proxyReq.headers).forEach(([k, v]) => res.set(k, v));
-    res.send(proxyReq.data);
-  } catch (err) {
-    customLog('error', `[Proxy] ${username} failed: ${err.message}`);
-    res.status(502).send('Upstream error');
-  }
-});
-
-// Root
-app.get('/', (req, res) => {
-  res.json({
-    status: 'Proxy Relay Live',
-    healthy: activeProxies.size,
-    initialized: isInitialized,
-    endpoints: {
-      health: '/health',
-      metrics: '/metrics',
-      userProxies: '/user_proxies?format=json',
-      proxy: '/proxy/<url> (Basic Auth)'
-    }
+  // Set timeout
+  proxyReq.setTimeout(TIMEOUT, () => {
+    proxyReq.destroy();
+    res.writeHead(408, { 'Content-Type': 'text/plain' });
+    res.end('Request Timeout.');
   });
 });
 
-// START SERVER FIRST - Zero Delay
-const PORT = process.env.PORT || 3000;
-const server = app.listen(PORT, '0.0.0.0', () => {
-  customLog('info', `Server on ${PORT} - Instant Ready!`);
+// Start the server
+server.listen(PROXY_PORT, () => {
+  console.log(`HTTP-only proxy server with basic auth and /users endpoint running on ${PROXY_HOST}:${PROXY_PORT}`);
+  console.log('Access users (plain text): http://localhost:8080/users');
+  console.log('Example proxy with auth: curl -x http://127.0.0.1:8080 -U user1:pass1 http://httpbin.org/ip');
+  console.log('Supports 100 unique users with credentials. Handles 100+ concurrent authenticated requests efficiently.');
 });
 
-// Async Init After Start
-setImmediate(async () => {
-  try {
-    await loadProxies();
-    isInitialized = true;
-    customLog('info', 'Init done (proxies ready).');
-
-    if (HEALTH_CHECK_ENABLED && !SKIP_INITIAL_HEALTH) {
-      setTimeout(healthCheck, INITIAL_HEALTH_DELAY);
-    }
-    if (HEALTH_CHECK_ENABLED) {
-      setInterval(healthCheck, 5 * 60 * 1000); // 5min periodic
-    }
-  } catch (err) {
-    customLog('error', `Init error: ${err.message}`);
-  }
-});
-
-// Shutdown
-process.on('SIGTERM', () => {
-  customLog('info', 'Shutting down');
-  server.close(() => process.exit(0));
-});
+// Graceful shutdown
 process.on('SIGINT', () => {
-  server.close(() => process.exit(0));
+  server.close(() => {
+    console.log('Proxy server stopped.');
+    process.exit(0);
+  });
 });
