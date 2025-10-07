@@ -2,9 +2,9 @@ const http = require('http');
 const url = require('url');
 const crypto = require('crypto'); // For base64 decoding in auth
 
-const PROXY_PORT = 8080;
+const PROXY_PORT = process.env.PORT || 8080; // Render uses PORT env var
+const PROXY_HOST = process.env.RENDER_EXTERNAL_HOSTNAME || 'localhost'; // Render domain or fallback
 const TIMEOUT = 10000; // 10s timeout for requests
-const PROXY_HOST = '127.0.0.1'; // Actual IP (change to your server's IP if remote)
 
 // In-memory storage for 100 users' credentials (generated on startup for speed)
 const userCredentials = new Map();
@@ -59,7 +59,7 @@ const server = http.createServer((req, res) => {
     res.writeHead(200, { 'Content-Type': 'text/plain' });
     const users = generateUsers(); // Regenerate for freshness (or use pre-generated)
     const output = users.map(user => 
-      `http://${user.username}:${user.password}@${PROXY_HOST}:${PROXY_PORT}`
+      `http://${user.username}:${user.password}@${PROXY_HOST}` // No port in URL (Render uses 443/80 externally)
     ).join('\n');
     res.end(output + '\n'); // One line per user, with trailing newline
     return;
@@ -131,12 +131,12 @@ const server = http.createServer((req, res) => {
   });
 });
 
-// Start the server
-server.listen(PROXY_PORT, () => {
+// Start the server (bind to 0.0.0.0 for Render)
+server.listen(PROXY_PORT, '0.0.0.0', () => {
   console.log(`HTTP-only proxy server with basic auth and /users endpoint running on ${PROXY_HOST}:${PROXY_PORT}`);
-  console.log('Access users (plain text): http://localhost:8080/users');
-  console.log('Example proxy with auth: curl -x http://127.0.0.1:8080 -U user1:pass1 http://httpbin.org/ip');
-  console.log('Supports 100 unique users with credentials. Handles 100+ concurrent authenticated requests efficiently.');
+  console.log('Access users (plain text): https://${PROXY_HOST}/users'); // Render uses HTTPS externally
+  console.log('Example proxy with auth: curl -x http://${PROXY_HOST} -U user1:pass1 http://httpbin.org/ip');
+  console.log('Supports 100 unique users with credentials. Handles concurrent requests efficiently (free tier limits apply).');
 });
 
 // Graceful shutdown
