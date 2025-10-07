@@ -1,6 +1,0 @@
-    {
-      "name": "My Dev Container",
-      "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
-      "forwardPorts": [8000, 1080],
-      "postCreateCommand": "npm install"
-    }
